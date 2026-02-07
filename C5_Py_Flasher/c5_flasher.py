@@ -3,7 +3,7 @@
 import sys
 import subprocess
 import os
-import platform   # Placeholder for possible OS checks
+import platform
 import glob
 import time
 import shutil
@@ -49,11 +49,83 @@ def find_file(name_options, bins_dir):
             return files[0]
     return None
 
-def main():
-    parser = argparse.ArgumentParser(description="ESP32-C5 Auto Flasher (bins subdir)")
-    parser.parse_args()
+CHIP_CONFIGS = {
+    "esp32c5": {
+        "display_name": "ESP32-C5",
+        "bootloader_offset": "0x2000",
+        "partition_offset": "0x8000",
+        "ota_offset": "0xd000",
+        "app_offset": "0x10000",
+        "esptool_chip": "esp32c5",
+    },
+    "esp32": {
+        "display_name": "ESP32",
+        "bootloader_offset": "0x1000",
+        "partition_offset": "0x8000",
+        "ota_offset": "0xd000",
+        "app_offset": "0x10000",
+        "esptool_chip": "esp32",
+    },
+    "esp32-a1s": {
+        "display_name": "ESP32-A1S",
+        "bootloader_offset": "0x1000",
+        "partition_offset": "0x8000",
+        "ota_offset": "0xd000",
+        "app_offset": "0x10000",
+        "esptool_chip": "esp32",
+    },
+}
 
-    bins_dir = os.path.join(os.path.dirname(__file__), 'bins')
+def list_serial_ports():
+    return [port.device for port in serial.tools.list_ports.comports()]
+
+def choose_port(available_ports, preferred=None):
+    if preferred and preferred in available_ports:
+        return preferred
+    if len(available_ports) == 1:
+        return available_ports[0]
+    print(Fore.YELLOW + "Multiple serial ports detected:" + Style.RESET_ALL)
+    for idx, port in enumerate(available_ports, start=1):
+        print(f"{idx}) {port}")
+    while True:
+        selection = input(Fore.YELLOW + "Select the port number to use: " + Style.RESET_ALL).strip()
+        if selection.isdigit():
+            choice = int(selection)
+            if 1 <= choice <= len(available_ports):
+                return available_ports[choice - 1]
+        print(Fore.RED + "Invalid selection. Please try again." + Style.RESET_ALL)
+
+def main():
+    parser = argparse.ArgumentParser(description="ESP32 Auto Flasher (bins subdir)")
+    parser.add_argument(
+        "--chip",
+        default="esp32c5",
+        choices=sorted(CHIP_CONFIGS.keys()),
+        help="Target chip type (default: esp32c5). Use esp32-a1s for ESP32-A1S.",
+    )
+    parser.add_argument(
+        "--port",
+        default=None,
+        help="Serial port to use (optional). If not provided, auto-detects.",
+    )
+    parser.add_argument(
+        "--baud",
+        default="921600",
+        help="Baud rate for flashing (default: 921600).",
+    )
+    parser.add_argument(
+        "--bins-dir",
+        default=os.path.join(os.path.dirname(__file__), "bins"),
+        help="Directory containing the .bin files (default: bins folder).",
+    )
+    parser.add_argument(
+        "--no-wait",
+        action="store_true",
+        help="Skip waiting for a new device and instead select from available ports.",
+    )
+    args = parser.parse_args()
+
+    bins_dir = args.bins_dir
     if not os.path.isdir(bins_dir):
         print(Fore.RED + f"Bins directory not found: {bins_dir}\nPlease create a 'bins' folder with your .bin files." + Style.RESET_ALL)
         exit(1)
@@ -99,17 +171,34 @@ def main():
     ]
     print(Fore.MAGENTA + "\n" + "\n".join(center(line) for line in logo_lines + splash_lines) + Style.RESET_ALL)
 
+    chip_config = CHIP_CONFIGS[args.chip]
+    chip_label = chip_config["display_name"]
+
     # Wait for ESP32 device to show up as a new serial port
-    existing_ports = set([port.device for port in serial.tools.list_ports.comports()])
-    print(Fore.YELLOW + "Waiting for ESP32-C5 device to be connected..." + Style.RESET_ALL)
-    while True:
-        current_ports = set([port.device for port in serial.tools.list_ports.comports()])
-        new_ports = current_ports - existing_ports
-        if new_ports:
-            serial_port = new_ports.pop()
-            break
-        time.sleep(0.5)
-    print(Fore.GREEN + f"Detected ESP32-C5 on port: {serial_port}" + Style.RESET_ALL)
+    serial_port = None
+    if args.port:
+        available_ports = list_serial_ports()
+        serial_port = choose_port(available_ports, preferred=args.port)
+    elif not args.no_wait:
+        existing_ports = set(list_serial_ports())
+        print(Fore.YELLOW + f"Waiting for {chip_label} device to be connected..." + Style.RESET_ALL)
+        wait_start = time.time()
+        while time.time() - wait_start < 30:
+            current_ports = set(list_serial_ports())
+            new_ports = current_ports - existing_ports
+            if new_ports:
+                macos_ports = [p for p in new_ports if p.startswith("/dev/cu.")]
+                serial_port = macos_ports[0] if macos_ports else new_ports.pop()
+                break
+            time.sleep(0.5)
+    if serial_port is None:
+        available_ports = list_serial_ports()
+        if not available_ports:
+            print(Fore.RED + "No serial ports detected. Please connect your device and try again." + Style.RESET_ALL)
+            exit(1)
+        serial_port = choose_port(available_ports)
+
+    print(Fore.GREEN + f"Using serial port: {serial_port}" + Style.RESET_ALL)
 
     # Find bin files for each firmware component
     bootloader = find_file(['bootloader.bin'], bins_dir)
@@ -126,34 +215,35 @@ def main():
     app_bin = max(firmware_bins, key=lambda f: os.path.getsize(f))
 
     # Print summary, ask for confirmation before flashing
-    print(Fore.CYAN + f"\nBootloader:   {bootloader or 'NOT FOUND'}")
+    print(Fore.CYAN + f"\nTarget chip:  {chip_label}")
+    print(f"Bootloader:   {bootloader or 'NOT FOUND'}")
     print(f"Partitions:   {partitions or 'NOT FOUND'}")
     print(f"OTA Data:     {ota_data or 'NOT FOUND'}")
     print(f"App (main):   {app_bin}\n" + Style.RESET_ALL)
     if not (bootloader and partitions):
         print(Fore.RED + "Missing bootloader or partition table. Both are required for a complete flash!" + Style.RESET_ALL)
         exit(1)
-    confirm = input(Fore.YELLOW + "Ready to flash these files to ESP32-C5? (y/N): " + Style.RESET_ALL)
+    confirm = input(Fore.YELLOW + f"Ready to flash these files to {chip_label}? (y/N): " + Style.RESET_ALL)
     if confirm.strip().lower() != 'y':
         print("Aborting.")
         exit(0)
 
-    # Flash using esptool, with offsets for C5
+    # Flash using esptool, with offsets per chip
     esptool_args = [
-        '--chip', 'esp32c5',
+        '--chip', chip_config["esptool_chip"],
         '--port', serial_port,
-        '--baud', '921600',
+        '--baud', str(args.baud),
         '--before', 'default_reset',
         '--after', 'hard_reset',
         'write_flash', '-z',
-        '0x2000', bootloader,
-        '0x8000', partitions,
+        chip_config["bootloader_offset"], bootloader,
+        chip_config["partition_offset"], partitions,
     ]
     if ota_data:
-        esptool_args += ['0xd000', ota_data]
-    esptool_args += ['0x10000', app_bin]
+        esptool_args += [chip_config["ota_offset"], ota_data]
+    esptool_args += [chip_config["app_offset"], app_bin]
 
-    print(Fore.YELLOW + "Flashing ESP32-C5 with bootloader, partition table, and application..." + Style.RESET_ALL)
+    print(Fore.YELLOW + f"Flashing {chip_label} with bootloader, partition table, and application..." + Style.RESET_ALL)
     try:
         esptool.main(esptool_args)
         print(Fore.GREEN + "Flashing complete!" + Style.RESET_ALL)
